@@ -12,6 +12,8 @@ target/
 *.iml
 *.ipr
 *.yml
+*.db
+*.log
 ### Eclipse ###
 .apt_generated
 .classpath
