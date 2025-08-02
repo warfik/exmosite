@@ -1,5 +1,7 @@
 package com.crypto.service;
 
+import com.crypto.model.BalanceHistoryPoint;
+import com.crypto.model.Trade;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -11,7 +13,6 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.stream.Collectors;
-import com.crypto.model.Trade;
 
 @Service
 @RequiredArgsConstructor
@@ -22,7 +23,42 @@ public class BalanceService {
     private final BalanceHistoryService balanceHistoryService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    // Метод для получения основных данных: баланс, сделки, PnL
+    /**
+     * Загружает все сделки пользователя со всех валютных пар через API EXMO.
+     * @return Список сделок.
+     */
+    private List<Trade> fetchAllUserTradesFromApi() {
+        List<Trade> allApiTrades = new ArrayList<>();
+        try {
+            // 1. Получаем все доступные валютные пары
+            String pairSettingsJson = exmoApiClient.post("pair_settings", new HashMap<>());
+            Map<String, Object> pairSettings = objectMapper.readValue(pairSettingsJson, new TypeReference<>() {});
+
+            // 2. Формируем запрос для получения сделок по всем парам
+            String pairsToRequest = String.join(",", pairSettings.keySet());
+            Map<String, String> params = new HashMap<>();
+            params.put("pair", pairsToRequest);
+            params.put("limit", "1000"); // Загружаем до 1000 последних сделок для каждой пары
+
+            // 3. Выполняем запрос к API
+            String userTradesJson = exmoApiClient.post("user_trades", params);
+            Map<String, List<Trade>> tradesByPair = objectMapper.readValue(userTradesJson, new TypeReference<>() {});
+
+            // 4. Собираем все сделки из разных пар в один список
+            tradesByPair.values().forEach(allApiTrades::addAll);
+            System.out.println("Загружено " + allApiTrades.size() + " новых сделок из API.");
+
+        } catch (Exception e) {
+            System.err.println("Не удалось загрузить сделки пользователя с EXMO API: " + e.getMessage());
+            // В случае ошибки возвращаем пустой список, чтобы приложение продолжило работу с локальной историей
+        }
+        return allApiTrades;
+    }
+
+    /**
+     * Основной метод для сбора всех данных для панели управления.
+     * @return Карта с данными для фронтенда.
+     */
     public Map<String, Object> fetchBalanceAndTrades() {
         Map<String, Object> result = new HashMap<>();
         try {
@@ -36,92 +72,60 @@ public class BalanceService {
             JSONObject balances = userInfo.getJSONObject("balances");
             JSONObject reserved = userInfo.getJSONObject("reserved");
 
-            // Объединяем все активы (доступные и зарезервированные)
             Set<String> allAssetNames = new HashSet<>();
             allAssetNames.addAll(balances.keySet());
             allAssetNames.addAll(reserved.keySet());
 
-            // 2. Получение текущих рыночных цен для всех активов
+            // 2. Получение текущих рыночных цен
             Map<String, Double> marketPrices = getMarketPrices(allAssetNames);
 
-            // 3. Расчет текущей стоимости портфеля (Current Market Value)
+            // 3. Расчет текущей стоимости портфеля
             double currentMarketValue = 0.0;
             for (String asset : allAssetNames) {
-                double available = Double.parseDouble(balances.optString(asset, "0"));
-                double inOrders = Double.parseDouble(reserved.optString(asset, "0"));
-                double totalAssetAmount = available + inOrders;
-
+                double totalAssetAmount = Double.parseDouble(balances.optString(asset, "0")) + Double.parseDouble(reserved.optString(asset, "0"));
                 if (totalAssetAmount > 0) {
-                    double price = marketPrices.getOrDefault(asset.toUpperCase() + "_USDT", 0.0);
-                    if (asset.equalsIgnoreCase("USDT") || asset.equalsIgnoreCase("USDC")) {
+                    if (asset.equalsIgnoreCase("USDT") || asset.equalsIgnoreCase("USDC") || asset.equalsIgnoreCase("USD")) {
                         currentMarketValue += totalAssetAmount;
                     } else {
+                        double price = marketPrices.getOrDefault(asset.toUpperCase() + "_USDT", 0.0);
                         currentMarketValue += totalAssetAmount * price;
                     }
                 }
             }
             result.put("totalUsd", currentMarketValue);
             result.put("totalBtc", currentMarketValue > 0 && marketPrices.getOrDefault("BTC_USDT", 0.0) > 0
-                    ? currentMarketValue / marketPrices.get("BTC_USDT")
-                    : 0);
+                    ? currentMarketValue / marketPrices.get("BTC_USDT") : 0);
 
-            // 4. Получение всех сделок пользователя для расчета инвестиций и PnL
+            // 4. Загрузка последних сделок из API и их сохранение в локальный лог
+            List<Trade> newApiTrades = fetchAllUserTradesFromApi();
+            if (!newApiTrades.isEmpty()) {
+                tradeHistoryService.logTrades(newApiTrades);
+            }
+
+            // 5. Чтение полной, обновленной истории сделок из локального лога
             List<Trade> allTrades = tradeHistoryService.readAllTrades();
 
-            // 5. Расчет начальных инвестиций (общего PnL)
-            // ВНИМАНИЕ: Если "Общая прибыль/убыток" показывает большие расхождения,
-            // проверьте реализацию tradeHistoryService.calculateInitialInvestment().
-            // Этот метод должен корректно вычислять чистый вложенный капитал,
-            // учитывая все покупки, продажи, депозиты и выводы за всю историю.
-            double initialInvestment = tradeHistoryService.calculateInitialInvestment(allTrades);
-            result.put("initialInvestment", initialInvestment);
+            // 6. Расчет прибыли/убытка за последние 24 часа (PnL 24h)
+            double balance24hAgo = balanceHistoryService.getBalance24HoursAgo()
+                    .map(BalanceHistoryPoint::getBalance)
+                    .orElse(currentMarketValue); // Если истории нет, считаем, что изменений не было
 
-            // 6. Расчет общей прибыли/убытка (Profit/Loss)
-            double pnlValue = currentMarketValue - initialInvestment;
-            double pnlPercentage = (initialInvestment > 0) ? (pnlValue / initialInvestment) * 100 : 0;
-            result.put("pnl", Map.of("value", pnlValue, "percentage", pnlPercentage));
-
-            // 7. Получение последних сделок для отображения в таблице
-            // Фильтруем сделки за последние 24 часа
-            long twentyFourHoursAgo = Instant.now().minus(24, ChronoUnit.HOURS).getEpochSecond();
-            List<Trade> recentTrades = allTrades.stream()
-                    .filter(t -> t.getDate() > twentyFourHoursAgo)
-                    .sorted(Comparator.comparing(Trade::getDate).reversed())
-                    .collect(Collectors.toList());
-
-            tradeHistoryService.logTrades(allTrades);
-            result.put("transactions", recentTrades);
-
-            // 8. Расчет количества сделок за последние 24 часа
-            long buys24h = recentTrades.stream()
-                    .filter(t -> t.getType().equalsIgnoreCase("buy"))
-                    .count();
-            long sells24h = recentTrades.stream()
-                    .filter(t -> t.getType().equalsIgnoreCase("sell"))
-                    .count();
-            result.put("trades", Map.of("buys", buys24h, "sells", sells24h));
-
-            // 9. Расчет прибыли/убытка за последние 24 часа (PnL 24h)
-            double pnl24hValue = 0.0;
-            double totalBuyCost24h = 0.0;
-            double totalSellRevenue24h = 0.0;
-
-            for (Trade trade : recentTrades) {
-                // Предполагаем, что price в Trade уже указана в USDT или базовой валюте пары
-                // и что amount - это количество базовой валюты
-                double tradeValueInUsdt = trade.getAmount() * trade.getPrice();
-
-                if (trade.getType().equalsIgnoreCase("buy")) {
-                    totalBuyCost24h += tradeValueInUsdt;
-                } else if (trade.getType().equalsIgnoreCase("sell")) {
-                    totalSellRevenue24h += tradeValueInUsdt;
-                }
-            }
-            pnl24hValue = totalSellRevenue24h - totalBuyCost24h; // Реализованный PnL за 24 часа
-
-            double pnl24hPercentage = (totalBuyCost24h > 0) ? (pnl24hValue / totalBuyCost24h) * 100 : 0;
+            double pnl24hValue = currentMarketValue - balance24hAgo;
+            double pnl24hPercentage = (balance24hAgo > 0 && balance24hAgo != currentMarketValue) ? (pnl24hValue / balance24hAgo) * 100 : 0;
             result.put("pnl24h", Map.of("value", pnl24hValue, "percentage", pnl24hPercentage));
 
+            // 7. Фильтрация сделок за последние 24 часа для таблицы транзакций
+            long twentyFourHoursAgo = Instant.now().minus(24, ChronoUnit.HOURS).getEpochSecond();
+            List<Trade> recentTrades = allTrades.stream()
+                    .filter(t -> t.getDate() >= twentyFourHoursAgo)
+                    .sorted(Comparator.comparing(Trade::getDate).reversed())
+                    .collect(Collectors.toList());
+            result.put("transactions", recentTrades);
+
+            // 8. Подсчет количества сделок "buy" и "sell" за последние 24 часа
+            long buys24h = recentTrades.stream().filter(t -> "buy".equalsIgnoreCase(t.getType())).count();
+            long sells24h = recentTrades.stream().filter(t -> "sell".equalsIgnoreCase(t.getType())).count();
+            result.put("trades", Map.of("buys", buys24h, "sells", sells24h));
 
         } catch (Exception e) {
             System.err.println("Ошибка в BalanceService: " + e.getMessage());
@@ -140,14 +144,11 @@ public class BalanceService {
         for (String asset : assets) {
             String pair = asset.toUpperCase() + "_USDT";
             if (tickerInfo.has(pair)) {
-                JSONObject pairTicker = tickerInfo.getJSONObject(pair);
-                prices.put(pair, Double.parseDouble(pairTicker.optString("last_trade", "0")));
+                prices.put(pair, Double.parseDouble(tickerInfo.getJSONObject(pair).optString("last_trade", "0")));
             }
         }
-        // Убедимся, что цена BTC есть всегда, если он есть в портфеле или для конвертации
         if (!prices.containsKey("BTC_USDT") && tickerInfo.has("BTC_USDT")) {
-            JSONObject pairTicker = tickerInfo.getJSONObject("BTC_USDT");
-            prices.put("BTC_USDT", Double.parseDouble(pairTicker.optString("last_trade", "0")));
+            prices.put("BTC_USDT", Double.parseDouble(tickerInfo.getJSONObject("BTC_USDT").optString("last_trade", "0")));
         }
         return prices;
     }
