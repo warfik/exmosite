@@ -1,6 +1,5 @@
 package com.crypto.service;
 
-import com.crypto.model.Trade;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -12,6 +11,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.stream.Collectors;
+import com.crypto.model.Trade;
 
 @Service
 @RequiredArgsConstructor
@@ -34,34 +34,29 @@ public class BalanceService {
             }
 
             JSONObject balances = userInfo.getJSONObject("balances");
-            JSONObject reserved = userInfo.getJSONObject("reserved"); // Получаем зарезервированные средства
+            JSONObject reserved = userInfo.getJSONObject("reserved");
 
             // Объединяем все активы (доступные и зарезервированные)
-            Map<String, Double> allAssetsCombined = new HashMap<>();
-            for (String asset : balances.keySet()) {
-                double available = Double.parseDouble(balances.optString(asset, "0"));
-                allAssetsCombined.put(asset, allAssetsCombined.getOrDefault(asset, 0.0) + available);
-            }
-            for (String asset : reserved.keySet()) {
-                double inOrders = Double.parseDouble(reserved.optString(asset, "0"));
-                allAssetsCombined.put(asset, allAssetsCombined.getOrDefault(asset, 0.0) + inOrders);
-            }
+            Set<String> allAssetNames = new HashSet<>();
+            allAssetNames.addAll(balances.keySet());
+            allAssetNames.addAll(reserved.keySet());
 
             // 2. Получение текущих рыночных цен для всех активов
-            Map<String, Double> marketPrices = getMarketPrices(allAssetsCombined.keySet());
+            Map<String, Double> marketPrices = getMarketPrices(allAssetNames);
 
             // 3. Расчет текущей стоимости портфеля (Current Market Value)
             double currentMarketValue = 0.0;
-            for (Map.Entry<String, Double> entry : allAssetsCombined.entrySet()) {
-                String asset = entry.getKey();
-                double totalAmount = entry.getValue();
+            for (String asset : allAssetNames) {
+                double available = Double.parseDouble(balances.optString(asset, "0"));
+                double inOrders = Double.parseDouble(reserved.optString(asset, "0"));
+                double totalAssetAmount = available + inOrders;
 
-                if (totalAmount > 0) {
+                if (totalAssetAmount > 0) {
                     double price = marketPrices.getOrDefault(asset.toUpperCase() + "_USDT", 0.0);
                     if (asset.equalsIgnoreCase("USDT") || asset.equalsIgnoreCase("USDC")) {
-                        currentMarketValue += totalAmount; // Для стейблкоинов просто добавляем сумму
+                        currentMarketValue += totalAssetAmount;
                     } else {
-                        currentMarketValue += totalAmount * price; // Для других активов умножаем на цену
+                        currentMarketValue += totalAssetAmount * price;
                     }
                 }
             }
@@ -73,41 +68,59 @@ public class BalanceService {
             // 4. Получение всех сделок пользователя для расчета инвестиций и PnL
             List<Trade> allTrades = tradeHistoryService.readAllTrades();
 
-            // 5. Расчет начальных инвестиций
-            // Пересчитываем initialInvestment, чтобы он учитывал только реальные "покупки" в USD
-            // Для этого фильтруем только те покупки, где пара заканчивается на _USDT
-            double initialInvestment = allTrades.stream()
-                    .filter(trade -> "buy".equalsIgnoreCase(trade.getType()))
-                    .filter(trade -> trade.getPair().toUpperCase().endsWith("_USDT")) // Добавляем фильтр по паре
-                    .mapToDouble(Trade::getAmount) // 'amount' уже в USD для пар типа XXX_USDT
-                    .sum();
+            // 5. Расчет начальных инвестиций (общего PnL)
+            // ВНИМАНИЕ: Если "Общая прибыль/убыток" показывает большие расхождения,
+            // проверьте реализацию tradeHistoryService.calculateInitialInvestment().
+            // Этот метод должен корректно вычислять чистый вложенный капитал,
+            // учитывая все покупки, продажи, депозиты и выводы за всю историю.
+            double initialInvestment = tradeHistoryService.calculateInitialInvestment(allTrades);
             result.put("initialInvestment", initialInvestment);
 
-            // 6. Расчет прибыли/убытка (Profit/Loss)
+            // 6. Расчет общей прибыли/убытка (Profit/Loss)
             double pnlValue = currentMarketValue - initialInvestment;
             double pnlPercentage = (initialInvestment > 0) ? (pnlValue / initialInvestment) * 100 : 0;
             result.put("pnl", Map.of("value", pnlValue, "percentage", pnlPercentage));
 
-            // 7. Получение последних сделок для отображения в таблице (можно использовать API)
+            // 7. Получение последних сделок для отображения в таблице
             // Фильтруем сделки за последние 24 часа
             long twentyFourHoursAgo = Instant.now().minus(24, ChronoUnit.HOURS).getEpochSecond();
             List<Trade> recentTrades = allTrades.stream()
                     .filter(t -> t.getDate() > twentyFourHoursAgo)
-                    .sorted(Comparator.comparing(Trade::getDate).reversed()) // Сортируем по дате убывания
+                    .sorted(Comparator.comparing(Trade::getDate).reversed())
                     .collect(Collectors.toList());
 
-            tradeHistoryService.logTrades(allTrades); // Логируем все сделки, если были новые
-            result.put("transactions", recentTrades); // Теперь отправляем только сделки за последние 24 часа
-
+            tradeHistoryService.logTrades(allTrades);
+            result.put("transactions", recentTrades);
 
             // 8. Расчет количества сделок за последние 24 часа
-            long buys24h = recentTrades.stream() // Используем уже отфильтрованный список
+            long buys24h = recentTrades.stream()
                     .filter(t -> t.getType().equalsIgnoreCase("buy"))
                     .count();
-            long sells24h = recentTrades.stream() // Используем уже отфильтрованный список
+            long sells24h = recentTrades.stream()
                     .filter(t -> t.getType().equalsIgnoreCase("sell"))
                     .count();
             result.put("trades", Map.of("buys", buys24h, "sells", sells24h));
+
+            // 9. Расчет прибыли/убытка за последние 24 часа (PnL 24h)
+            double pnl24hValue = 0.0;
+            double totalBuyCost24h = 0.0;
+            double totalSellRevenue24h = 0.0;
+
+            for (Trade trade : recentTrades) {
+                // Предполагаем, что price в Trade уже указана в USDT или базовой валюте пары
+                // и что amount - это количество базовой валюты
+                double tradeValueInUsdt = trade.getAmount() * trade.getPrice();
+
+                if (trade.getType().equalsIgnoreCase("buy")) {
+                    totalBuyCost24h += tradeValueInUsdt;
+                } else if (trade.getType().equalsIgnoreCase("sell")) {
+                    totalSellRevenue24h += tradeValueInUsdt;
+                }
+            }
+            pnl24hValue = totalSellRevenue24h - totalBuyCost24h; // Реализованный PnL за 24 часа
+
+            double pnl24hPercentage = (totalBuyCost24h > 0) ? (pnl24hValue / totalBuyCost24h) * 100 : 0;
+            result.put("pnl24h", Map.of("value", pnl24hValue, "percentage", pnl24hPercentage));
 
 
         } catch (Exception e) {

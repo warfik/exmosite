@@ -10,6 +10,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.*;
 import java.io.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Component
 @RequiredArgsConstructor
@@ -23,9 +24,15 @@ public class ExmoApiClient {
 
     private static final String API_URL = "https://api.exmo.com/v1.1/";
 
+    // Создаем атомарный счетчик для nonce.
+    // Он инициализируется текущим временем и будет безопасно увеличиваться
+    // при каждом запросе, даже в многопоточной среде.
+    private final AtomicLong nonce = new AtomicLong(System.currentTimeMillis());
+
     public String post(String method, Map<String, String> params) throws Exception {
-        String nonce = String.valueOf(System.currentTimeMillis());
-        params.put("nonce", nonce);
+        // Получаем новое, уникальное и строго возрастающее значение nonce
+        String nonceValue = String.valueOf(this.nonce.incrementAndGet());
+        params.put("nonce", nonceValue);
 
         String postData = buildQuery(params);
         String sign = hmacSha512(postData, secret);
@@ -67,6 +74,10 @@ public class ExmoApiClient {
         StringBuilder result = new StringBuilder();
         for (Map.Entry<String, String> entry : params.entrySet())
             result.append(entry.getKey()).append("=").append(entry.getValue()).append("&");
-        return result.substring(0, result.length() - 1);
+        // Исправлена потенциальная ошибка, если params пустые
+        if (result.length() > 0) {
+            return result.substring(0, result.length() - 1);
+        }
+        return "";
     }
 }
