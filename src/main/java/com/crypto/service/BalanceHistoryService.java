@@ -13,10 +13,7 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -71,7 +68,7 @@ public class BalanceHistoryService {
     }
 
     /**
-     * Находит последнее значение баланса, записанное примерно 24 часа назад.
+     * Находит последнее значение баланса, записанное ПЕРЕД или В момент "24 часа назад".
      * @return Optional с точкой баланса или empty, если история недоступна.
      */
     public Optional<BalanceHistoryPoint> getBalance24HoursAgo() {
@@ -90,6 +87,30 @@ public class BalanceHistoryService {
             return Optional.empty();
         }
     }
+
+    /**
+     * НОВЫЙ МЕТОД
+     * Находит самую первую (самую старую) запись о балансе в пределах последних 24 часов.
+     * Используется как fallback, если приложение работает менее 24 часов.
+     * @return Optional с самой первой точкой баланса или empty, если история за этот период пуста.
+     */
+    public Optional<BalanceHistoryPoint> getEarliestBalanceWithin24h() {
+        if (!Files.exists(HISTORY_FILE)) {
+            return Optional.empty();
+        }
+        long twentyFourHoursAgo = Instant.now().minus(24, ChronoUnit.HOURS).toEpochMilli();
+
+        try (Stream<String> stream = Files.lines(HISTORY_FILE)) {
+            return stream
+                    .map(this::parseLine)
+                    .filter(point -> point != null && point.getTimestamp() >= twentyFourHoursAgo)
+                    .min(BalanceHistoryPoint::compareTo); // Находим самую раннюю точку (с минимальным timestamp) за последние 24ч
+        } catch (IOException e) {
+            System.err.println("Ошибка чтения самой ранней записи за 24ч: " + e.getMessage());
+            return Optional.empty();
+        }
+    }
+
 
     /**
      * Запускает очистку старых записей в файле истории каждый день в 2 часа ночи.
@@ -127,10 +148,12 @@ public class BalanceHistoryService {
     private BalanceHistoryPoint parseLine(String line) {
         try {
             String[] parts = line.split(",");
+            if (parts.length < 2) return null; // Проверка на корректность строки
             long timestamp = Long.parseLong(parts[0]);
             double balance = Double.parseDouble(parts[1]);
             return new BalanceHistoryPoint(timestamp, balance);
-        } catch (Exception e) {
+        } catch (NumberFormatException e) {
+            // Игнорируем поврежденные строки, чтобы не засорять лог
             return null;
         }
     }

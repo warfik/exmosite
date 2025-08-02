@@ -105,14 +105,29 @@ public class BalanceService {
             // 5. Чтение полной, обновленной истории сделок из локального лога
             List<Trade> allTrades = tradeHistoryService.readAllTrades();
 
-            // 6. Расчет прибыли/убытка за последние 24 часа (PnL 24h)
-            double balance24hAgo = balanceHistoryService.getBalance24HoursAgo()
-                    .map(BalanceHistoryPoint::getBalance)
-                    .orElse(currentMarketValue); // Если истории нет, считаем, что изменений не было
+            // 6. ОБНОВЛЕННЫЙ БЛОК: Расчет прибыли/убытка за последние 24 часа (PnL 24h)
+            // Сначала пытаемся найти баланс, ближайший к отметке "24 часа назад".
+            Optional<BalanceHistoryPoint> historicalBalancePoint = balanceHistoryService.getBalance24HoursAgo();
 
-            double pnl24hValue = currentMarketValue - balance24hAgo;
-            double pnl24hPercentage = (balance24hAgo > 0 && balance24hAgo != currentMarketValue) ? (pnl24hValue / balance24hAgo) * 100 : 0;
+            // Если его нет (например, приложение работает меньше 24ч), ищем самую первую запись В ПРЕДЕЛАХ последних 24 часов.
+            if (historicalBalancePoint.isEmpty()) {
+                historicalBalancePoint = balanceHistoryService.getEarliestBalanceWithin24h();
+            }
+
+            double pnl24hValue = 0;
+            double pnl24hPercentage = 0;
+
+            // Рассчитываем PnL, только если нашли какую-либо историческую точку для сравнения.
+            if (historicalBalancePoint.isPresent()) {
+                double historicalBalance = historicalBalancePoint.get().getBalance();
+                pnl24hValue = currentMarketValue - historicalBalance;
+                if (historicalBalance > 0) { // Защита от деления на ноль
+                    pnl24hPercentage = (pnl24hValue / historicalBalance) * 100;
+                }
+            }
+            // Если история пуста, значения останутся нулевыми, что корректно.
             result.put("pnl24h", Map.of("value", pnl24hValue, "percentage", pnl24hPercentage));
+
 
             // 7. Фильтрация сделок за последние 24 часа для таблицы транзакций
             long twentyFourHoursAgo = Instant.now().minus(24, ChronoUnit.HOURS).getEpochSecond();
@@ -158,9 +173,30 @@ public class BalanceService {
     public void recordHourlyBalance() {
         System.out.println("Сохранение часового среза баланса...");
         try {
-            Map<String, Object> data = fetchBalanceAndTrades();
-            if (!data.containsKey("error")) {
-                double currentBalance = (double) data.get("totalUsd");
+            // Используем урезанную версию метода, чтобы не вызывать всю цепочку запросов
+            String userInfoJson = exmoApiClient.post("user_info", new HashMap<>());
+            JSONObject userInfo = new JSONObject(new JSONObject(userInfoJson).toString()); // Пересоздаем объект для надежности
+            Set<String> assetNames = new HashSet<>(userInfo.getJSONObject("balances").keySet());
+            assetNames.addAll(userInfo.getJSONObject("reserved").keySet());
+
+            Map<String, Double> prices = getMarketPrices(assetNames);
+            double currentBalance = 0.0;
+
+            JSONObject balances = userInfo.getJSONObject("balances");
+            JSONObject reserved = userInfo.getJSONObject("reserved");
+
+            for (String asset : assetNames) {
+                double totalAsset = Double.parseDouble(balances.optString(asset, "0")) + Double.parseDouble(reserved.optString(asset, "0"));
+                if (totalAsset > 0) {
+                    if (asset.equalsIgnoreCase("USDT") || asset.equalsIgnoreCase("USDC") || asset.equalsIgnoreCase("USD")) {
+                        currentBalance += totalAsset;
+                    } else {
+                        currentBalance += totalAsset * prices.getOrDefault(asset.toUpperCase() + "_USDT", 0.0);
+                    }
+                }
+            }
+
+            if (currentBalance > 0) {
                 balanceHistoryService.saveBalance(currentBalance);
             }
         } catch (Exception e) {
